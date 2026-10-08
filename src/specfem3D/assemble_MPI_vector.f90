@@ -1025,3 +1025,135 @@
 
   end subroutine assemble_MPI_scalar_write_cuda
 
+
+!
+!-------------------------------------------------------------------------------------------------
+!
+
+  subroutine check_MPI_interface_consistency(NPROC,NGLOB_AB,array_val, &
+                                             label,it)
+
+! debugging routine: checks that values of a vector field stored on MPI
+! interface points are identical on all processes sharing the point.
+!
+! sends the local values on each interface to the neighbor, receives the
+! neighbor's values for the same (ordered) interface points and reports the
+! maximum absolute and relative mismatch. calling it with the mesh
+! coordinates (x/y/zstore) instead of a wavefield also validates that the
+! interface point ordering is consistent between neighboring slices.
+!
+! :type NPROC: integer
+! :param NPROC: number of MPI processes
+! :type NGLOB_AB: integer
+! :param NGLOB_AB: number of local global points
+! :type array_val: real(CUSTOM_REAL), dimension(NDIM,NGLOB_AB)
+! :param array_val: vector field to check (e.g. displ, veloc, accel)
+! :type label: character(len=*)
+! :param label: name of the field, used in the output message
+! :type it: integer
+! :param it: current time step, used in the output message
+
+  use constants, only: NDIM,CUSTOM_REAL,itag,myrank,IMAIN
+  use specfem_par, only: num_interfaces_ext_mesh, &
+    max_nibool_interfaces_ext_mesh,nibool_interfaces_ext_mesh, &
+    ibool_interfaces_ext_mesh,my_neighbors_ext_mesh
+
+  implicit none
+
+  integer,intent(in) :: NPROC,NGLOB_AB,it
+  real(kind=CUSTOM_REAL), dimension(NDIM,NGLOB_AB),intent(in) :: array_val
+  character(len=*),intent(in) :: label
+
+  ! local parameters
+  real(kind=CUSTOM_REAL), dimension(:,:,:), allocatable :: buf_send,buf_recv
+  integer, dimension(:), allocatable :: req_send,req_recv
+  integer :: iinterface,ipoin,iglob,ier
+  integer :: ipoin_max,iinterface_max
+  real(kind=CUSTOM_REAL) :: diff,diff_max,diff_max_all
+  real(kind=CUSTOM_REAL) :: val_max,val_max_all
+
+  if (NPROC <= 1) return
+
+  allocate(buf_send(NDIM,max_nibool_interfaces_ext_mesh, &
+                    num_interfaces_ext_mesh), &
+           buf_recv(NDIM,max_nibool_interfaces_ext_mesh, &
+                    num_interfaces_ext_mesh), &
+           req_send(num_interfaces_ext_mesh), &
+           req_recv(num_interfaces_ext_mesh),stat=ier)
+  if (ier /= 0) stop 'Error allocating interface check buffers'
+  buf_send(:,:,:) = 0.0_CUSTOM_REAL
+  buf_recv(:,:,:) = 0.0_CUSTOM_REAL
+
+  ! fills buffers with local values (no assembly)
+  do iinterface = 1, num_interfaces_ext_mesh
+    do ipoin = 1, nibool_interfaces_ext_mesh(iinterface)
+      iglob = ibool_interfaces_ext_mesh(ipoin,iinterface)
+      buf_send(:,ipoin,iinterface) = array_val(:,iglob)
+    enddo
+  enddo
+
+  do iinterface = 1, num_interfaces_ext_mesh
+    call isend_cr(buf_send(1,1,iinterface), &
+                  NDIM*nibool_interfaces_ext_mesh(iinterface), &
+                  my_neighbors_ext_mesh(iinterface),itag, &
+                  req_send(iinterface))
+    call irecv_cr(buf_recv(1,1,iinterface), &
+                  NDIM*nibool_interfaces_ext_mesh(iinterface), &
+                  my_neighbors_ext_mesh(iinterface),itag, &
+                  req_recv(iinterface))
+  enddo
+  do iinterface = 1, num_interfaces_ext_mesh
+    call wait_req(req_recv(iinterface))
+  enddo
+
+  ! compares neighbor values against local ones
+  diff_max = 0.0_CUSTOM_REAL
+  val_max = maxval(abs(array_val))
+  ipoin_max = 0
+  iinterface_max = 0
+  do iinterface = 1, num_interfaces_ext_mesh
+    do ipoin = 1, nibool_interfaces_ext_mesh(iinterface)
+      diff = maxval(abs(buf_recv(:,ipoin,iinterface) &
+                        - buf_send(:,ipoin,iinterface)))
+      if (diff > diff_max) then
+        diff_max = diff
+        ipoin_max = ipoin
+        iinterface_max = iinterface
+      endif
+    enddo
+  enddo
+
+  do iinterface = 1, num_interfaces_ext_mesh
+    call wait_req(req_send(iinterface))
+  enddo
+
+  ! per-rank report for the worst offending point
+  if (diff_max > 0.0_CUSTOM_REAL) then
+    iglob = ibool_interfaces_ext_mesh(ipoin_max,iinterface_max)
+    print '(a,a,a,i8,a,i6,a,i6,a,i10,a,es12.4,a,3es14.6,a,3es14.6)', &
+      'debug interface check ',trim(label),': it = ',it, &
+      ' rank ',myrank,' neighbor ',my_neighbors_ext_mesh(iinterface_max), &
+      ' iglob ',iglob,' max diff ',diff_max, &
+      ' local ',buf_send(:,ipoin_max,iinterface_max), &
+      ' remote ',buf_recv(:,ipoin_max,iinterface_max)
+  endif
+
+  call max_all_cr(diff_max,diff_max_all)
+  call max_all_cr(val_max,val_max_all)
+  if (myrank == 0) then
+    if (val_max_all > 0.0_CUSTOM_REAL) then
+      write(IMAIN,'(a,a,a,i8,a,es12.4,a,es12.4)') &
+        ' debug interface check ',trim(label),': it = ',it, &
+        ' max abs diff = ',diff_max_all, &
+        ' relative = ',diff_max_all / val_max_all
+    else
+      write(IMAIN,'(a,a,a,i8,a,es12.4)') &
+        ' debug interface check ',trim(label),': it = ',it, &
+        ' max abs diff = ',diff_max_all
+    endif
+    call flush_IMAIN()
+  endif
+
+  deallocate(buf_send,buf_recv,req_send,req_recv)
+
+  end subroutine check_MPI_interface_consistency

@@ -62,6 +62,20 @@
   double precision :: t_start,tCPU
   logical, parameter :: DO_TIMING = .false.
 
+  ! debug MPI interfaces (multi-GPU boundary artifacts, issues #1866/#1880)
+  ! DEBUG_MPI_INTERFACE: checks that displ (before forces) and assembled
+  !                      accel (after MPI assembly) are identical on all
+  !                      slices sharing an interface point, every
+  !                      DEBUG_MPI_INTERFACE_NSTEP steps; at it == 1 also
+  !                      checks the interface point coordinates.
+  ! DEBUG_FORCE_SYNC_ACCEL: forces assembled accel to be bit-identical on
+  !                         all slices sharing a point (as for faults).
+  logical, parameter :: DEBUG_MPI_INTERFACE = .false.
+  integer, parameter :: DEBUG_MPI_INTERFACE_NSTEP = 100
+  logical, parameter :: DEBUG_FORCE_SYNC_ACCEL = .false.
+  real(kind=CUSTOM_REAL), dimension(:,:), allocatable :: debug_coords
+  logical :: do_debug_check
+
   ! GPU
   if (GPU_MODE) then
     ! checks if for kernel simulation with both, forward & backward fields
@@ -78,6 +92,27 @@
 
   ! forward fields
   backward_simulation = .false.
+
+  ! debug MPI interfaces
+  do_debug_check = DEBUG_MPI_INTERFACE .and. NPROC > 1 .and. &
+    (it == 1 .or. mod(it,DEBUG_MPI_INTERFACE_NSTEP) == 0)
+  if (do_debug_check) then
+    if (it == 1) then
+      ! interface point locations must match between neighbors
+      allocate(debug_coords(NDIM,NGLOB_AB))
+      debug_coords(1,:) = xstore(:)
+      debug_coords(2,:) = ystore(:)
+      debug_coords(3,:) = zstore(:)
+      call check_MPI_interface_consistency(NPROC,NGLOB_AB,debug_coords, &
+                                           'coords',it)
+      deallocate(debug_coords)
+    endif
+    if (GPU_MODE) then
+      call transfer_displ_from_device(NDIM*NGLOB_AB,displ,Mesh_pointer)
+    endif
+    call check_MPI_interface_consistency(NPROC,NGLOB_AB,displ, &
+                                         'displ',it)
+  endif
 
   ! added the following two synchronizations to ensure that the displacement and velocity values
   ! at nodes on MPI interfaces stay equal on all processors that share the node.
@@ -337,6 +372,29 @@
       endif
     endif
   enddo
+
+  ! debug MPI interfaces: assembled accel must agree on shared points
+  if (do_debug_check) then
+    if (GPU_MODE) then
+      call transfer_accel_from_device(NDIM*NGLOB_AB,accel,Mesh_pointer)
+    endif
+    call check_MPI_interface_consistency(NPROC,NGLOB_AB,accel, &
+                                         'accel',it)
+  endif
+
+  ! debug: enforces identical assembled accel on all shared points
+  if (DEBUG_FORCE_SYNC_ACCEL .and. NPROC > 1) then
+    if (GPU_MODE) then
+      call transfer_accel_from_device(NDIM*NGLOB_AB,accel,Mesh_pointer)
+    endif
+    call synchronize_MPI_vector_blocking_ord(NPROC,NGLOB_AB,accel, &
+           num_interfaces_ext_mesh,max_nibool_interfaces_ext_mesh, &
+           nibool_interfaces_ext_mesh,ibool_interfaces_ext_mesh, &
+           my_neighbors_ext_mesh)
+    if (GPU_MODE) then
+      call transfer_accel_to_device(NDIM*NGLOB_AB,accel,Mesh_pointer)
+    endif
+  endif
 
   ! adds rotation contributions
   if (ROTATION) then
