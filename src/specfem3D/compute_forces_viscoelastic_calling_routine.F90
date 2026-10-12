@@ -70,7 +70,7 @@
   !                      checks the interface point coordinates.
   ! DEBUG_FORCE_SYNC_ACCEL: forces assembled accel to be bit-identical on
   !                         all slices sharing a point (as for faults).
-  logical, parameter :: DEBUG_MPI_INTERFACE = .false.
+  logical, parameter :: DEBUG_MPI_INTERFACE = .true.
   integer, parameter :: DEBUG_MPI_INTERFACE_NSTEP = 100
   logical, parameter :: DEBUG_FORCE_SYNC_ACCEL = .false.
   real(kind=CUSTOM_REAL), dimension(:,:), allocatable :: debug_coords
