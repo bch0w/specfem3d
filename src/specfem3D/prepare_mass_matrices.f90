@@ -139,6 +139,9 @@
       ! mass matrix inversion
       ! for efficiency, invert final mass matrix once and for all on each slice
       rmass_ocean_load(:) = 1._CUSTOM_REAL / rmass_ocean_load(:)
+
+      ! unique ocean load normals, consistent across MPI partitions
+      call prepare_ocean_load_normals()
     endif
   endif
 
@@ -343,3 +346,101 @@
 
   end subroutine prepare_mass_matrices_rotation
 
+
+!
+!-------------------------------------------------------------------------------------------------
+!
+
+  subroutine prepare_ocean_load_normals()
+
+! sets a unique normal for each global point on the free surface,
+! used by the approximate ocean load
+!
+! the ocean load term updates the acceleration of a free surface point along
+! the surface normal. previously, the normal was taken from whichever free
+! surface face first touched the point. with topography/bathymetry, adjacent
+! faces have different normals at shared points. for a point on an MPI
+! interface, each partition then used a different normal for its copy of the
+! point, and the copies slowly drifted apart, creating static displacement
+! artifacts along partition boundaries offshore (see issue #1880).
+!
+! here, we compute an area-weighted average of the face normals at each
+! global point, assemble it across MPI partitions, and overwrite the
+! free_surface_normal array, so that all faces (and all partitions) sharing
+! a point use exactly the same normal. note: free_surface_normal is only
+! used by the ocean load (on CPUs and GPUs).
+
+  use constants, only: NDIM,NGLLSQUARE,CUSTOM_REAL,IMAIN,myrank
+  use specfem_par, only: NPROC,NGLOB_AB,ibool, &
+    num_free_surface_faces,free_surface_normal,free_surface_ijk, &
+    free_surface_ispec,free_surface_jacobian2Dw, &
+    num_interfaces_ext_mesh,max_nibool_interfaces_ext_mesh, &
+    nibool_interfaces_ext_mesh,ibool_interfaces_ext_mesh, &
+    my_neighbors_ext_mesh
+
+  implicit none
+
+  ! local parameters
+  real(kind=CUSTOM_REAL), dimension(:,:), allocatable :: normal_sum
+  real(kind=CUSTOM_REAL) :: norm
+  integer :: iface,igll,i,j,k,ispec,iglob,ier
+
+  ! user output
+  if (myrank == 0) then
+    write(IMAIN,*) "  setting up unique ocean load normals"
+    call flush_IMAIN()
+  endif
+
+  allocate(normal_sum(NDIM,NGLOB_AB),stat=ier)
+  if (ier /= 0) call exit_MPI(myrank,'Error allocating ocean normal array')
+  normal_sum(:,:) = 0._CUSTOM_REAL
+
+  ! area-weighted sum of face normals at each global point
+  do iface = 1,num_free_surface_faces
+    ispec = free_surface_ispec(iface)
+    do igll = 1,NGLLSQUARE
+      i = free_surface_ijk(1,igll,iface)
+      j = free_surface_ijk(2,igll,iface)
+      k = free_surface_ijk(3,igll,iface)
+      iglob = ibool(i,j,k,ispec)
+      normal_sum(:,iglob) = normal_sum(:,iglob) &
+        + free_surface_jacobian2Dw(igll,iface) &
+          * free_surface_normal(:,igll,iface)
+    enddo
+  enddo
+
+  ! adds contributions from neighboring partitions
+  call assemble_MPI_vector_blocking(NPROC,NGLOB_AB,normal_sum, &
+                                    num_interfaces_ext_mesh, &
+                                    max_nibool_interfaces_ext_mesh, &
+                                    nibool_interfaces_ext_mesh, &
+                                    ibool_interfaces_ext_mesh, &
+                                    my_neighbors_ext_mesh)
+
+  ! makes the assembled sums bit-identical on all partitions
+  ! (assembly adds contributions in a different order on each partition)
+  call synchronize_MPI_vector_blocking_ord(NPROC,NGLOB_AB,normal_sum, &
+                                           num_interfaces_ext_mesh, &
+                                           max_nibool_interfaces_ext_mesh, &
+                                           nibool_interfaces_ext_mesh, &
+                                           ibool_interfaces_ext_mesh, &
+                                           my_neighbors_ext_mesh)
+
+  ! replaces face normals by the normalized unique normal
+  do iface = 1,num_free_surface_faces
+    ispec = free_surface_ispec(iface)
+    do igll = 1,NGLLSQUARE
+      i = free_surface_ijk(1,igll,iface)
+      j = free_surface_ijk(2,igll,iface)
+      k = free_surface_ijk(3,igll,iface)
+      iglob = ibool(i,j,k,ispec)
+      norm = sqrt(sum(normal_sum(:,iglob)**2))
+      if (norm > 0._CUSTOM_REAL) then
+        free_surface_normal(:,igll,iface) = normal_sum(:,iglob) / norm
+      endif
+    enddo
+  enddo
+
+  deallocate(normal_sum)
+
+  end subroutine prepare_ocean_load_normals
